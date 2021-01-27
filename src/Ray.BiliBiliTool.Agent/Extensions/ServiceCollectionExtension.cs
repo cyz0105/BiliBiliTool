@@ -1,12 +1,11 @@
 ﻿using System;
 using System.Net;
 using System.Net.Http;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ray.BiliBiliTool.Agent.BiliBiliAgent.Interfaces;
-using Ray.BiliBiliTool.Agent.ServerChanAgent;
-using Ray.BiliBiliTool.Agent.ServerChanAgent.Interfaces;
+using Ray.BiliBiliTool.Agent.HttpClientDelegatingHandlers;
 using Ray.BiliBiliTool.Config.Options;
 using Ray.BiliBiliTool.Infrastructure;
 using Refit;
@@ -20,17 +19,27 @@ namespace Ray.BiliBiliTool.Agent.Extensions
         /// </summary>
         /// <param name="services"></param>
         /// <returns></returns>
-        public static IServiceCollection AddBiliBiliClientApi(this IServiceCollection services)
+        public static IServiceCollection AddBiliBiliClientApi(this IServiceCollection services, IConfiguration configuration)
         {
+            services.AddSingleton<BiliCookie>();
+
             //全局代理
-            services.SetGlobalProxy();
+            services.SetGlobalProxy(configuration);
+
+            //DelegatingHandler
+            services.Scan(scan => scan
+                .FromAssemblyOf<IBiliBiliApi>()
+                .AddClasses(classes => classes.AssignableTo<DelegatingHandler>())
+                .AsSelf()
+                .WithTransientLifetime()
+            );
 
             services.AddHttpClient();
             services.AddHttpClient("BiliBiliWithCookie",
                 (sp, c) =>
                 {
                     c.DefaultRequestHeaders.Add("Cookie",
-                        sp.GetRequiredService<IOptionsMonitor<BiliBiliCookieOptions>>().CurrentValue.ToString());
+                        sp.GetRequiredService<BiliCookie>().ToString());
                     c.DefaultRequestHeaders.Add("User-Agent",
                         sp.GetRequiredService<IOptionsMonitor<SecurityOptions>>().CurrentValue.UserAgent);
                 });
@@ -41,14 +50,6 @@ namespace Ray.BiliBiliTool.Agent.Extensions
             services.AddBiliBiliClientApi<IAccountApi>("https://account.bilibili.com");
             services.AddBiliBiliClientApi<ILiveApi>("https://api.live.bilibili.com");
             services.AddBiliBiliClientApi<IRelationApi>("https://api.bilibili.com/x/relation");
-
-            //server酱推送
-            services.AddRefitClient<IPushApi>(new RefitSettings(new SystemTextJsonContentSerializer(JsonSerializerOptionsBuilder.DefaultOptions)))
-                .ConfigureHttpClient((sp, c) =>
-                {
-                    c.BaseAddress = new Uri("http://sc.ftqq.com");
-                });
-            services.AddScoped<PushService>();
 
             return services;
         }
@@ -69,15 +70,13 @@ namespace Ray.BiliBiliTool.Agent.Extensions
                 .ConfigureHttpClient((sp, c) =>
                 {
                     c.DefaultRequestHeaders.Add("Cookie",
-                        sp.GetRequiredService<IOptionsMonitor<BiliBiliCookieOptions>>().CurrentValue.ToString());
+                        sp.GetRequiredService<BiliCookie>().ToString());
                     c.DefaultRequestHeaders.Add("User-Agent",
                         sp.GetRequiredService<IOptionsMonitor<SecurityOptions>>().CurrentValue.UserAgent);
                     c.BaseAddress = new Uri(host);
                 })
-                .AddHttpMessageHandler(sp => new MyHttpClientDelegatingHandler(
-                    sp.GetRequiredService<ILogger<MyHttpClientDelegatingHandler>>(),
-                    sp.GetRequiredService<IOptionsMonitor<SecurityOptions>>()
-                    ));
+                .AddHttpMessageHandler<IntervalDelegatingHandler>()
+                .AddHttpMessageHandler<LogDelegatingHandler>();
 
             return services;
         }
@@ -87,12 +86,31 @@ namespace Ray.BiliBiliTool.Agent.Extensions
         /// </summary>
         /// <param name="services"></param>
         /// <returns></returns>
-        private static IServiceCollection SetGlobalProxy(this IServiceCollection services)
+        private static IServiceCollection SetGlobalProxy(this IServiceCollection services, IConfiguration configuration)
         {
-            string proxyAddress = RayConfiguration.Root["WebProxy"];
+            string proxyAddress = configuration["Security:WebProxy"];
             if (proxyAddress.IsNotNullOrEmpty())
             {
-                HttpClient.DefaultProxy = new WebProxy(proxyAddress);
+                WebProxy webProxy = new WebProxy();
+
+                //user:password@host:port http proxy only .Tested with tinyproxy-1.11.0-rc1
+                if (proxyAddress.Contains("@"))
+                {
+                    string userPass = proxyAddress.Split("@")[0];
+                    string address = proxyAddress.Split("@")[1];
+
+                    string proxyUser = userPass.Split(":")[0];
+                    string proxyPass = userPass.Split(":")[1];
+
+                    webProxy.Address = new Uri("http://" + address);
+                    webProxy.Credentials = new NetworkCredential(proxyUser, proxyPass);
+                }
+                else
+                {
+                    webProxy.Address = new Uri(proxyAddress);
+                }
+
+                HttpClient.DefaultProxy = webProxy;
             }
 
             return services;
